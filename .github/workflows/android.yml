@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build APKs
+    name: Build WaEnhancer
     permissions:
       contents: read  # More secure than write-all
       actions: write  # For uploading artifacts
@@ -22,22 +22,22 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4.2.2 # Updated latest actions/checkout
         with:
           fetch-depth: 0  # Fetch all history for proper versioning
           
       - name: Set up JDK 23
-        uses: actions/setup-java@v4.7.1
+        uses: actions/setup-java@v4.7.1 # Updated latest actions/setup-java
         with:
-          java-version: '23'
-          distribution: 'zulu'
-          check-latest: true
+          java-version: '23' # Changed from JDK 17 to JDK 23
+          distribution: 'zulu' # Changed from Temurin to Zulu as it reduces about 30% compilation time
+          check-latest: true # To ask the lates JDK 23 subversion
           cache: gradle
           
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4.3.1
+        uses: gradle/actions/setup-gradle@v4.3.1 # added to update gradle and support latest JDK
         with:
-          gradle-version: 8.14
+          gradle-version: 8.10.2 # Does not work on newer versions, max supported version is 8.10.2. By using a newer version will be ignored
           
       - name: Configure signing key
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -102,25 +102,38 @@ jobs:
           name: business-debug-${{ env.VERSION_NAME || 'v' }}-${{ env.SHORT_SHA }}
           path: ./release-apks/app-business-debug.apk
           retention-days: 14
-      
-      - name: Clean debug state and sensitive files
-        if: always()
+          
+      - name: Post to Telegram channel
+        if: ${{ success() && github.ref == 'refs/heads/master' && github.ref_type != 'tag' }}
+        env:
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
         run: |
-          # Remove debug symbols and mapping files
-          rm -rf app/build/tmp
-          rm -rf app/build/intermediates
+          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
+            GITHUB_SHA_SHORT=$(git rev-parse --short HEAD)
+            export output_whatsapp=app/WaEnhancer_$GITHUB_SHA_SHORT.apk
+            export output_business=app/WaEnhancer_Business_$GITHUB_SHA_SHORT.apk
+            cp app/build/outputs/apk/whatsapp/debug/app-whatsapp-debug.apk $output_whatsapp
+            cp app/build/outputs/apk/business/debug/app-business-debug.apk $output_business
+            export LOG=$(cat changelog.txt)
+            ESCAPED=$(python3 -c 'import json,os,urllib.parse; msg = json.dumps(os.getenv("LOG")); print(urllib.parse.quote(msg if len(msg) <= 1024 else json.dumps(os.getenv("COMMIT_URL"))))')
           
-          # Clean up sensitive data
-          if [ -f "key.jks" ]; then
-            rm -f key.jks
-            grep -v "android.*Password\|android.*Alias\|android.*File" gradle.properties > gradle.properties.clean
-            mv gradle.properties.clean gradle.properties
+            # Send WhatsApp variant
+            curl "https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup?chat_id=${CHANNEL_ID}&media=%5B%7B%22type%22%3A%22document%22%2C%20%22media%22%3A%22attach%3A%2F%2Fwa%22%7D%2C%7B%22type%22%3A%22document%22%2C%20%22media%22%3A%22attach%3A%2F%2Fw4b%22%2C%22caption%22%3A${ESCAPED}%7D%5D" -F wa="@$output_whatsapp" -F w4b="@$output_business"
           fi
-          
-          # Clean up release APKs directory after artifacts have been uploaded
-          rm -rf ./release-apks
-          
-          echo "Debug state and sensitive files cleaned up"
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2.2.2 # Updated to latest softprops/action-gh-release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: WaEnhancer ${{ env.SHORT_SHA }}
+          body_path: changelog.txt
+          files: |
+            app/build/outputs/apk/whatsapp/debug/app-whatsapp-debug.apk
+            app/build/outputs/apk/business/debug/app-business-debug.apk
+          tag_name: debug-${{ env.SHORT_SHA }}
           
       - name: Upload build reports on failure
         if: failure()
