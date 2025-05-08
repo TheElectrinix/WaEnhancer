@@ -3,50 +3,131 @@ name: Android CI
 on:
   push:
     branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+    
+# Concurrency group to ensure only one workflow runs at a time
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    permissions: write-all
+    name: Build APKs
+    permissions:
+      contents: read  # More secure than write-all
+      actions: write  # For uploading artifacts
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && !contains(github.event.head_commit.message, 'Merge')
+    
     steps:
-      - uses: actions/checkout@v4
-      - name: set up JDK 22
-        uses: actions/setup-java@v4
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
         with:
-          java-version: '22'
+          fetch-depth: 0  # Fetch all history for proper versioning
+          
+      - name: Set up JDK 24
+        uses: actions/setup-java@v4.7.1
+        with:
+          java-version: '24'
           distribution: 'zulu'
+          check-latest: true
           cache: gradle
-
-      - name: Write key
-        if: github.event_name != 'pull_request'
+          
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4.3.1
+        with:
+          gradle-version: 8.14
+          
+      - name: Configure signing key
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          KEY_STORE_BASE64: ${{ secrets.KEY_STORE }}
         run: |
-          if [ ! -z "${{ secrets.KEY_STORE }}" ]; then
-          echo androidStorePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> gradle.properties
-          echo androidKeyAlias='${{ secrets.ALIAS }}' >> gradle.properties
-          echo androidKeyPassword='${{ secrets.KEY_PASSWORD }}' >> gradle.properties
-          echo androidStoreFile='key.jks' >> gradle.properties
-          echo ${{ secrets.KEY_STORE }} | base64 --decode > key.jks
+          if [ ! -z "$KEY_STORE_BASE64" ]; then
+            echo "Setting up signing keys..."
+            echo "androidStorePassword=${{ secrets.KEY_STORE_PASSWORD }}" >> gradle.properties
+            echo "androidKeyAlias=${{ secrets.ALIAS }}" >> gradle.properties
+            echo "androidKeyPassword=${{ secrets.KEY_PASSWORD }}" >> gradle.properties
+            echo "androidStoreFile=key.jks" >> gradle.properties
+            echo "$KEY_STORE_BASE64" | base64 --decode > key.jks
+          else
+            echo "No signing keys configured, skipping signing setup"
           fi
-
+          
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-
+        
+      - name: Cache Gradle packages
+        uses: actions/cache@v4.2.3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+            
       - name: Build all flavor variants
         run: |
-          ./gradlew assembleWhatsappDebug assembleBusinessDebug -Pminify=true
-
-      - name: Get short SHA
-        run: echo "SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
-
+          ./gradlew assembleWhatsappDebug assembleBusinessDebug -Pminify=true --stacktrace
+          
+      - name: Get version information
+        id: version
+        run: |
+          VERSION_NAME=$(./gradlew -q printVersionName)
+          VERSION_CODE=$(./gradlew -q printVersionCode)
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      - name: Prepare APKs for upload
+        run: |
+          # Copy APKs to a clean directory to avoid uploading debug files
+          mkdir -p ./release-apks
+          cp app/build/outputs/apk/whatsapp/debug/app-whatsapp-debug.apk ./release-apks/
+          cp app/build/outputs/apk/business/debug/app-business-debug.apk ./release-apks/
+      
       - name: Upload WhatsApp flavor artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
-          name: whatsapp-debug-app-${{ env.SHORT_SHA }}
-          path: app/build/outputs/apk/whatsapp/debug/app-whatsapp-debug.apk
-
+          name: whatsapp-debug-${{ env.VERSION_NAME || 'v' }}-${{ env.SHORT_SHA }}
+          path: ./release-apks/app-whatsapp-debug.apk
+          retention-days: 14
+          
       - name: Upload Business flavor artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
-          name: business-debug-app-${{ env.SHORT_SHA }}
-          path: app/build/outputs/apk/business/debug/app-business-debug.apk
-
+          name: business-debug-${{ env.VERSION_NAME || 'v' }}-${{ env.SHORT_SHA }}
+          path: ./release-apks/app-business-debug.apk
+          retention-days: 14
+      
+      - name: Clean debug state and sensitive files
+        if: always()
+        run: |
+          # Remove debug symbols and mapping files
+          rm -rf app/build/tmp
+          rm -rf app/build/intermediates
+          
+          # Clean up sensitive data
+          if [ -f "key.jks" ]; then
+            rm -f key.jks
+            grep -v "android.*Password\|android.*Alias\|android.*File" gradle.properties > gradle.properties.clean
+            mv gradle.properties.clean gradle.properties
+          fi
+          
+          # Clean up release APKs directory after artifacts have been uploaded
+          rm -rf ./release-apks
+          
+          echo "Debug state and sensitive files cleaned up"
+          
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: build-reports-${{ env.SHORT_SHA }}
+          path: |
+            app/build/reports/
+            */build/reports/
+          retention-days: 7
