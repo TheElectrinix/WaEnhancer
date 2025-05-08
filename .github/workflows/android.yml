@@ -103,7 +103,7 @@ jobs:
           path: ./release-apks/app-business-debug.apk
           retention-days: 14
           
-        - name: Post to Telegram channel
+      - name: Post to Telegram channel
         if: ${{ success() && github.ref == 'refs/heads/master' && github.ref_type != 'tag' }}
         env:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
